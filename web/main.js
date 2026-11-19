@@ -1,6 +1,7 @@
 // "Окно" эмулятора в браузере: рисует кадр, играет звук, ловит клавиши.
 // Сама эмуляция — в wasm (crates/a7800-web → crates/a7800-core).
 import init, { Console } from "./pkg/a7800_web.js";
+import { buildTestRom } from "./testrom.js";
 
 const SAMPLE_RATE = 48000;
 const FRAME_MS = 1000 / 59.92;
@@ -103,16 +104,21 @@ async function readFile(file) {
   return new Uint8Array(await file.arrayBuffer());
 }
 
-async function loadRom(file) {
+function startCartridge(data, name) {
   ensureAudio();
   try {
-    const title = con.load_cartridge(await readFile(file));
+    const title = con.load_cartridge(data);
     loaded = true;
     paused = false;
-    setStatus(title || file.name);
+    acc = 0;
+    setStatus(title || name);
   } catch (e) {
-    setStatus(`Не удалось открыть «${file.name}»: ${e.message ?? e}`);
+    setStatus(`Не удалось открыть «${name}»: ${e.message ?? e}`);
   }
+}
+
+async function loadRom(file) {
+  startCartridge(await readFile(file), file.name);
 }
 
 async function loadBios(file) {
@@ -218,7 +224,15 @@ async function main() {
     const f = e.target.files[0];
     if (f) loadBios(f);
   });
+  document.getElementById("demo").addEventListener("click", () => startCartridge(buildTestRom(), "тестовый экран"));
   document.getElementById("reset").addEventListener("click", () => con.reset());
+
+  // Панель отладки обновляется, пока открыта
+  const details = document.getElementById("debug");
+  const dbg = document.getElementById("dbg");
+  setInterval(() => {
+    if (details.open && loaded) dbg.textContent = con.debug_text();
+  }, 250);
   document.getElementById("pause").addEventListener("click", (e) => {
     paused = !paused;
     e.target.textContent = paused ? "Продолжить" : "Пауза";

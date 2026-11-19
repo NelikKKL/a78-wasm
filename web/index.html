@@ -46,6 +46,10 @@
     .row button { min-width: 110px; padding: 5px 10px; font-size: .92rem; }
     .row button.listening { border-color: var(--accent); color: var(--accent); }
     .actions { margin-top: 14px; display: flex; gap: 8px; }
+    details { margin-top: 28px; }
+    summary { cursor: pointer; font-weight: 600; }
+    #dbg { margin: 10px 0 0; padding: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+           font: 13px/1.6 ui-monospace, "SF Mono", Menlo, Consolas, monospace; white-space: pre-wrap; overflow-x: auto; }
     body.drag .screen { outline: 2px dashed var(--accent); outline-offset: 4px; }
     @media (prefers-reduced-motion: no-preference) { button, .file { transition: border-color .15s; } }
   </style>
@@ -57,6 +61,7 @@
       <div class="toolbar">
         <label class="file primary">Открыть игру<input id="rom" type="file" accept=".a78,.bin"></label>
         <label class="file">BIOS (необязательно)<input id="bios" type="file"></label>
+        <button id="demo" type="button">Тестовый экран</button>
         <button id="reset" type="button">Сброс</button>
         <button id="pause" type="button">Пауза</button>
       </div>
@@ -71,6 +76,12 @@
       <div id="controls"></div>
       <div class="actions"><button id="defaults" type="button">Вернуть по умолчанию</button></div>
     </section>
+
+    <details id="debug">
+      <summary>Отладка</summary>
+      <p class="hint">Если игра не запускается, скопируйте сюда текст ниже — по нему видно, на каком шаге всё остановилось.</p>
+      <pre id="dbg">Игра не загружена.</pre>
+    </details>
   </main>
   <script type="module" src="./main.js"></script>
 </body>

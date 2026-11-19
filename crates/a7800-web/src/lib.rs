@@ -64,6 +64,51 @@ impl Console {
         self.emu.take_audio()
     }
 
+    /// Текст для панели отладки: регистры, состояние MARIA, счётчики проблем.
+    pub fn debug_text(&self) -> String {
+        let d = self.emu.debug_info();
+        let unofficial = match d.last_unofficial {
+            Some((pc, op)) => format!(" (последний: {op:02X} по адресу {pc:04X})"),
+            None => String::new(),
+        };
+        let jam = match d.jam {
+            Some((pc, op)) => format!("\n!!! процессор завис на опкоде {op:02X} по адресу {pc:04X}"),
+            None => String::new(),
+        };
+        let unsupported = match d.last_unsupported_mode {
+            Some((rm, wm)) => format!(" (RM={rm}, WM={})", wm as u8),
+            None => String::new(),
+        };
+        format!(
+            "кадр {}, NMI {}\n\
+             PC={:04X} A={:02X} X={:02X} Y={:02X} SP={:02X} P={:02X}\n\
+             MARIA: {}, CTRL={:02X}, DPP={:04X}, CHARBASE={:02X}, фон={:02X}\n\
+             INPTCTRL={:02X}, BIOS: {}\n\
+             неофициальных опкодов выполнено: {}{}\n\
+             пропущено байтов графики (режим не реализован): {}{}{}",
+            d.frames,
+            d.nmi_count,
+            d.pc,
+            d.a,
+            d.x,
+            d.y,
+            d.sp,
+            d.p,
+            if d.maria_enabled { "вкл" } else { "выкл" },
+            d.ctrl,
+            d.dpp,
+            d.charbase,
+            d.background,
+            d.inptctrl,
+            if d.bios_enabled { "вкл" } else { "выкл" },
+            d.unofficial_ops,
+            unofficial,
+            d.unsupported_gfx_bytes,
+            unsupported,
+            jam,
+        )
+    }
+
     // ---- управление ----
 
     /// `code` — `KeyboardEvent.code`. Возвращает `true`, если клавиша привязана.

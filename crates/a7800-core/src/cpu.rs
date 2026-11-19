@@ -74,11 +74,31 @@ pub struct Cpu {
     pub sp: u8,
     pub pc: u16,
     pub p: u8,
+    /// Сколько раз встретился неофициальный опкод (он выполнен как NOP).
+    pub unofficial_count: u32,
+    /// Адрес и код последнего неофициального опкода.
+    pub last_unofficial: Option<(u16, u8)>,
+    /// Процессор "завис" на опкоде JAM/KIL: (адрес, опкод). Выйти можно только сбросом.
+    pub jam: Option<(u16, u8)>,
+    op_pc: u16,
+    op: u8,
 }
 
 impl Default for Cpu {
     fn default() -> Self {
-        Self { a: 0, x: 0, y: 0, sp: 0xFD, pc: 0, p: FI | FU }
+        Self {
+            a: 0,
+            x: 0,
+            y: 0,
+            sp: 0xFD,
+            pc: 0,
+            p: FI | FU,
+            unofficial_count: 0,
+            last_unofficial: None,
+            jam: None,
+            op_pc: 0,
+            op: 0,
+        }
     }
 }
 
@@ -91,11 +111,15 @@ impl Cpu {
     pub fn reset<T: Bus>(&mut self, bus: &mut T) {
         self.sp = 0xFD;
         self.p = FI | FU;
+        self.jam = None;
         self.pc = read16(bus, 0xFFFC);
     }
 
     /// Немаскируемое прерывание (в 7800 его выдаёт MARIA по флагу DLI). Возвращает такты.
     pub fn nmi<T: Bus>(&mut self, bus: &mut T) -> u32 {
+        if self.jam.is_some() {
+            return 0;
+        }
         self.push16(bus, self.pc);
         self.push(bus, (self.p & !FB) | FU);
         self.p |= FI;
@@ -105,7 +129,7 @@ impl Cpu {
 
     /// Маскируемое прерывание. Возвращает 0, если прерывания запрещены.
     pub fn irq<T: Bus>(&mut self, bus: &mut T) -> u32 {
-        if self.p & FI != 0 {
+        if self.p & FI != 0 || self.jam.is_some() {
             return 0;
         }
         self.push16(bus, self.pc);
@@ -116,6 +140,24 @@ impl Cpu {
     }
 
     // ---- вспомогательные операции ----
+
+    fn jam_cpu(&mut self) {
+        self.jam = Some((self.op_pc, self.op));
+    }
+
+    /// Запись для SHA/SHX/SHY/TAS: значение И (старший байт базового адреса + 1);
+    /// при переходе через страницу старший байт адреса подменяется значением.
+    fn store_high_and<T: Bus>(&mut self, bus: &mut T, addr: u16, index: u8, val: u8) {
+        let base = addr.wrapping_sub(index as u16);
+        let v = val & ((base >> 8) as u8).wrapping_add(1);
+        let target = if (base ^ addr) & 0xFF00 != 0 { ((v as u16) << 8) | (addr & 0x00FF) } else { addr };
+        bus.write(target, v);
+    }
+
+    fn flag_unofficial(&mut self) {
+        self.unofficial_count = self.unofficial_count.wrapping_add(1);
+        self.last_unofficial = Some((self.op_pc, self.op));
+    }
 
     fn fetch<T: Bus>(&mut self, bus: &mut T) -> u8 {
         let v = bus.read(self.pc);
@@ -308,7 +350,12 @@ impl Cpu {
 
     /// Выполняет одну инструкцию и возвращает число потраченных тактов.
     pub fn step<T: Bus>(&mut self, bus: &mut T) -> u32 {
+        if self.jam.is_some() {
+            return 2; // завис на JAM: время идёт, процессор стоит
+        }
+        self.op_pc = self.pc;
         let op = self.fetch(bus);
+        self.op = op;
         match op {
             0x00 => {
                 // BRK
@@ -473,7 +520,7 @@ impl Cpu {
                     1 => self.group1(bus, aaa, bbb),
                     2 => self.group2(bus, aaa, bbb),
                     0 => self.group0(bus, aaa, bbb),
-                    _ => 2, // неофициальные опкоды cc=11 — пока NOP
+                    _ => self.group3(bus, aaa, bbb),
                 }
             }
         }
@@ -495,6 +542,7 @@ impl Cpu {
         if aaa == 4 {
             if mode == Mode::Imm {
                 // 0x89: неофициальный NOP #imm
+                self.flag_unofficial();
                 self.pc = self.pc.wrapping_add(1);
                 return 2;
             }
@@ -528,8 +576,19 @@ impl Cpu {
         cycles(mode, Kind::Read, crossed)
     }
 
-    /// ASL ROL LSR ROR STX LDX DEC INC
+    /// ASL ROL LSR ROR STX LDX DEC INC (+ JAM, NOP, SHX)
     fn group2<T: Bus>(&mut self, bus: &mut T, aaa: u8, bbb: u8) -> u32 {
+        // JAM: 0x02 0x12 0x22 0x32 0x42 0x52 0x62 0x72 0x92 0xB2 0xD2 0xF2
+        if bbb == 4 || (bbb == 0 && aaa < 4) {
+            self.flag_unofficial();
+            self.jam_cpu();
+            return 2;
+        }
+        // 0x1A 0x3A 0x5A 0x7A 0xDA 0xFA — NOP (0x9A TXS и 0xBA TSX обработаны выше)
+        if bbb == 6 {
+            self.flag_unofficial();
+            return 2;
+        }
         let mode = match bbb {
             0 => Mode::Imm,
             1 => Mode::Zp,
@@ -542,25 +601,37 @@ impl Cpu {
                     Mode::Zpx
                 }
             }
-            7 => {
-                if aaa == 5 {
+            _ => {
+                // bbb == 7
+                if aaa == 4 || aaa == 5 {
                     Mode::Aby
                 } else {
                     Mode::Abx
                 }
             }
-            _ => return 2, // JAM и прочее неофициальное
         };
         match aaa {
-            4 => {
-                if !matches!(mode, Mode::Zp | Mode::Abs | Mode::Zpy) {
-                    let _ = self.addr(bus, mode);
-                    return 2;
+            4 => match mode {
+                Mode::Zp | Mode::Abs | Mode::Zpy => {
+                    let (a, _) = self.addr(bus, mode);
+                    bus.write(a, self.x);
+                    cycles(mode, Kind::Write, false)
                 }
-                let (a, _) = self.addr(bus, mode);
-                bus.write(a, self.x);
-                cycles(mode, Kind::Write, false)
-            }
+                Mode::Aby => {
+                    // 0x9E SHX abs,Y
+                    self.flag_unofficial();
+                    let (a, _) = self.addr(bus, mode);
+                    let (y, x) = (self.y, self.x);
+                    self.store_high_and(bus, a, y, x);
+                    cycles(mode, Kind::Write, false)
+                }
+                _ => {
+                    // 0x82 NOP #imm
+                    self.flag_unofficial();
+                    let _ = self.addr(bus, mode);
+                    2
+                }
+            },
             5 => {
                 let (a, crossed) = self.addr(bus, mode);
                 let v = bus.read(a);
@@ -569,7 +640,9 @@ impl Cpu {
                 cycles(mode, Kind::Read, crossed)
             }
             _ => {
-                if mode == Mode::Imm || (mode == Mode::Acc && aaa >= 6) {
+                if mode == Mode::Imm {
+                    // 0xC2 0xE2 — NOP #imm
+                    self.flag_unofficial();
                     let _ = self.addr(bus, mode);
                     return 2;
                 }
@@ -601,7 +674,7 @@ impl Cpu {
         }
     }
 
-    /// BIT STY LDY CPY CPX (+ неофициальные NOP с операндами)
+    /// BIT STY LDY CPY CPX (+ SHY и NOP с операндами)
     fn group0<T: Bus>(&mut self, bus: &mut T, aaa: u8, bbb: u8) -> u32 {
         let mode = match bbb {
             0 => Mode::Imm,
@@ -609,8 +682,20 @@ impl Cpu {
             3 => Mode::Abs,
             5 => Mode::Zpx,
             7 => Mode::Abx,
-            _ => return 2,
+            _ => {
+                // bbb 2/4/6 — реализованы выше (стек, ветвления, флаги); сюда не попадаем
+                self.flag_unofficial();
+                return 2;
+            }
         };
+        // 0x9C SHY abs,X
+        if aaa == 4 && mode == Mode::Abx {
+            self.flag_unofficial();
+            let (a, _) = self.addr(bus, mode);
+            let (x, y) = (self.x, self.y);
+            self.store_high_and(bus, a, x, y);
+            return cycles(mode, Kind::Write, false);
+        }
         let valid = match aaa {
             1 => matches!(mode, Mode::Zp | Mode::Abs),
             4 => matches!(mode, Mode::Zp | Mode::Abs | Mode::Zpx),
@@ -619,7 +704,13 @@ impl Cpu {
             _ => false,
         };
         if !valid {
-            let (_, crossed) = self.addr(bus, mode);
+            // Неофициальные NOP: 0x04 0x0C 0x14 0x1C 0x34 0x3C 0x44 0x54 0x5C 0x64 0x74 0x7C
+            // 0x80 0xD4 0xDC 0xF4 0xFC. Операнд из памяти читается, результат отбрасывается.
+            self.flag_unofficial();
+            let (a, crossed) = self.addr(bus, mode);
+            if mode != Mode::Imm {
+                let _ = bus.read(a);
+            }
             return cycles(mode, Kind::Read, crossed);
         }
         if aaa == 4 {
@@ -643,6 +734,164 @@ impl Cpu {
             _ => self.cmp(self.x, v),
         }
         cycles(mode, Kind::Read, crossed)
+    }
+
+    /// Все опкоды с cc = 11 — "составные" неофициальные инструкции:
+    /// SLO RLA SRE RRA SAX LAX DCP ISC, а также ANC ALR ARR XAA LAX# AXS SBC#
+    /// SHA TAS LAS.
+    fn group3<T: Bus>(&mut self, bus: &mut T, aaa: u8, bbb: u8) -> u32 {
+        self.flag_unofficial();
+
+        // bbb == 2: операции с непосредственным операндом
+        if bbb == 2 {
+            let (a, _) = self.addr(bus, Mode::Imm);
+            let v = bus.read(a);
+            match aaa {
+                0 | 1 => {
+                    // ANC: A &= imm, C = N
+                    self.a &= v;
+                    self.set_nz(self.a);
+                    self.set_flag(FC, self.a & 0x80 != 0);
+                }
+                2 => {
+                    // ALR: A &= imm, затем LSR A
+                    self.a &= v;
+                    let r = self.lsr(self.a);
+                    self.a = r;
+                }
+                3 => {
+                    // ARR: A &= imm, затем ROR A (флаги C/V особые; десятичный режим не учтён)
+                    self.a &= v;
+                    let r = (self.a >> 1) | ((self.p & FC) << 7);
+                    self.a = r;
+                    self.set_nz(r);
+                    self.set_flag(FC, r & 0x40 != 0);
+                    self.set_flag(FV, ((r >> 6) ^ (r >> 5)) & 1 != 0);
+                }
+                4 => {
+                    // XAA (ANE): нестабильная; берём типичную "магическую" константу 0xEE
+                    self.a = (self.a | 0xEE) & self.x & v;
+                    self.set_nz(self.a);
+                }
+                5 => {
+                    // LAX #imm (0xAB): нестабильная; упрощённо A = X = imm
+                    self.a = v;
+                    self.x = v;
+                    self.set_nz(v);
+                }
+                6 => {
+                    // AXS (SBX): X = (A & X) - imm, флаги как у CMP
+                    let t = self.a & self.x;
+                    self.set_flag(FC, t >= v);
+                    self.x = t.wrapping_sub(v);
+                    self.set_nz(self.x);
+                }
+                _ => self.sbc(v), // 0xEB — то же, что SBC #imm
+            }
+            return 2;
+        }
+
+        let mode = match bbb {
+            0 => Mode::Inx,
+            1 => Mode::Zp,
+            3 => Mode::Abs,
+            4 => Mode::Iny,
+            5 => {
+                if aaa == 4 || aaa == 5 {
+                    Mode::Zpy
+                } else {
+                    Mode::Zpx
+                }
+            }
+            6 => Mode::Aby,
+            _ => {
+                // bbb == 7
+                if aaa == 4 || aaa == 5 {
+                    Mode::Aby
+                } else {
+                    Mode::Abx
+                }
+            }
+        };
+
+        match aaa {
+            4 => {
+                // SAX (0x83 0x87 0x8F 0x97), SHA (0x93 0x9F), TAS (0x9B)
+                let (a, _) = self.addr(bus, mode);
+                match bbb {
+                    0 | 1 | 3 | 5 => bus.write(a, self.a & self.x),
+                    6 => {
+                        self.sp = self.a & self.x;
+                        let (y, sp) = (self.y, self.sp);
+                        self.store_high_and(bus, a, y, sp);
+                    }
+                    _ => {
+                        let (y, v) = (self.y, self.a & self.x);
+                        self.store_high_and(bus, a, y, v);
+                    }
+                }
+                cycles(mode, Kind::Write, false)
+            }
+            5 => {
+                // LAX (A = X = M) и LAS (0xBB: A = X = SP = M & SP)
+                let (a, crossed) = self.addr(bus, mode);
+                let v = bus.read(a);
+                if bbb == 6 {
+                    let r = v & self.sp;
+                    self.a = r;
+                    self.x = r;
+                    self.sp = r;
+                    self.set_nz(r);
+                } else {
+                    self.a = v;
+                    self.x = v;
+                    self.set_nz(v);
+                }
+                cycles(mode, Kind::Read, crossed)
+            }
+            _ => {
+                // SLO RLA SRE RRA DCP ISC: чтение-изменение-запись + операция над A
+                let (a, _) = self.addr(bus, mode);
+                let m = bus.read(a);
+                let r = match aaa {
+                    0 => {
+                        let r = self.asl(m);
+                        self.a |= r;
+                        self.set_nz(self.a);
+                        r
+                    }
+                    1 => {
+                        let r = self.rol(m);
+                        self.a &= r;
+                        self.set_nz(self.a);
+                        r
+                    }
+                    2 => {
+                        let r = self.lsr(m);
+                        self.a ^= r;
+                        self.set_nz(self.a);
+                        r
+                    }
+                    3 => {
+                        let r = self.ror(m);
+                        self.adc(r);
+                        r
+                    }
+                    6 => {
+                        let r = m.wrapping_sub(1);
+                        self.cmp(self.a, r);
+                        r
+                    }
+                    _ => {
+                        let r = m.wrapping_add(1);
+                        self.sbc(r);
+                        r
+                    }
+                };
+                bus.write(a, r);
+                cycles(mode, Kind::Rmw, false)
+            }
+        }
     }
 }
 
@@ -705,6 +954,101 @@ mod tests {
         prog[0x10] = 0x60; // RTS
         let (cpu, _) = run(&prog, 2);
         assert_eq!(cpu.pc, 0x0203);
+    }
+
+    #[test]
+    fn every_opcode_executes_without_panic() {
+        for op in 0..=255u8 {
+            let mut ram = Ram(vec![0; 0x10000]);
+            ram.0[0x0200] = op;
+            let mut cpu = Cpu::new();
+            cpu.pc = 0x0200;
+            let c = cpu.step(&mut ram);
+            assert!((2..=8).contains(&c), "опкод {op:02X}: {c} тактов");
+        }
+    }
+
+    #[test]
+    fn lax_loads_a_and_x() {
+        // LDA #$80 ; STA $10 ; LDA #$00 ; LAX $10
+        let (cpu, _) = run(&[0xA9, 0x80, 0x85, 0x10, 0xA9, 0x00, 0xA7, 0x10], 4);
+        assert_eq!((cpu.a, cpu.x), (0x80, 0x80));
+        assert_ne!(cpu.p & FN, 0);
+    }
+
+    #[test]
+    fn sax_stores_a_and_x() {
+        // LDA #$F0 ; LDX #$3C ; SAX $10
+        let (_, ram) = run(&[0xA9, 0xF0, 0xA2, 0x3C, 0x87, 0x10], 3);
+        assert_eq!(ram.0[0x10], 0x30);
+    }
+
+    #[test]
+    fn dcp_decrements_then_compares() {
+        // LDA #$05 ; STA $10 ; LDA #$04 ; DCP $10
+        let (cpu, ram) = run(&[0xA9, 0x05, 0x85, 0x10, 0xA9, 0x04, 0xC7, 0x10], 4);
+        assert_eq!(ram.0[0x10], 0x04);
+        assert_ne!(cpu.p & FZ, 0);
+        assert_ne!(cpu.p & FC, 0);
+    }
+
+    #[test]
+    fn isc_increments_then_subtracts() {
+        // SEC ; LDA #$10 ; STA $10 ; LDA #$20 ; ISC $10
+        let (cpu, ram) = run(&[0x38, 0xA9, 0x10, 0x85, 0x10, 0xA9, 0x20, 0xE7, 0x10], 5);
+        assert_eq!(ram.0[0x10], 0x11);
+        assert_eq!(cpu.a, 0x0F);
+    }
+
+    #[test]
+    fn slo_and_rra() {
+        // LDA #$81 ; STA $10 ; LDA #$01 ; SLO $10
+        let (cpu, ram) = run(&[0xA9, 0x81, 0x85, 0x10, 0xA9, 0x01, 0x07, 0x10], 4);
+        assert_eq!(ram.0[0x10], 0x02);
+        assert_eq!(cpu.a, 0x03);
+        assert_ne!(cpu.p & FC, 0);
+
+        // CLC ; LDA #$02 ; STA $10 ; LDA #$10 ; RRA $10
+        let (cpu, ram) = run(&[0x18, 0xA9, 0x02, 0x85, 0x10, 0xA9, 0x10, 0x67, 0x10], 5);
+        assert_eq!(ram.0[0x10], 0x01);
+        assert_eq!(cpu.a, 0x11);
+    }
+
+    #[test]
+    fn immediate_unofficial_ops() {
+        // LDA #$FF ; ANC #$80
+        let (cpu, _) = run(&[0xA9, 0xFF, 0x0B, 0x80], 2);
+        assert_eq!(cpu.a, 0x80);
+        assert_ne!(cpu.p & FC, 0);
+
+        // LDA #$FF ; LDX #$0F ; AXS #$05
+        let (cpu, _) = run(&[0xA9, 0xFF, 0xA2, 0x0F, 0xCB, 0x05], 3);
+        assert_eq!(cpu.x, 0x0A);
+        assert_ne!(cpu.p & FC, 0);
+
+        // SEC ; LDA #$10 ; SBC #$01 (опкод 0xEB)
+        let (cpu, _) = run(&[0x38, 0xA9, 0x10, 0xEB, 0x01], 3);
+        assert_eq!(cpu.a, 0x0F);
+    }
+
+    #[test]
+    fn unofficial_nops_have_right_length() {
+        // NOP ; NOP zp ; NOP abs ; NOP #imm ; NOP zp,X ; NOP abs,X ; LDA #$7F
+        let prog = [0x1A, 0x04, 0x00, 0x0C, 0x00, 0x00, 0x80, 0x00, 0x14, 0x00, 0x1C, 0x00, 0x00, 0xA9, 0x7F];
+        let (cpu, _) = run(&prog, 7);
+        assert_eq!(cpu.a, 0x7F);
+        assert_eq!(cpu.pc, 0x0200 + prog.len() as u16);
+    }
+
+    #[test]
+    fn jam_halts_cpu() {
+        let (mut cpu, mut ram) = run(&[0x02, 0xEA], 1);
+        assert_eq!(cpu.jam, Some((0x0200, 0x02)));
+        let pc = cpu.pc;
+        cpu.step(&mut ram);
+        assert_eq!(cpu.pc, pc);
+        cpu.reset(&mut ram);
+        assert_eq!(cpu.jam, None);
     }
 
     #[test]

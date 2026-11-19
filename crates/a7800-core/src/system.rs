@@ -114,6 +114,11 @@ impl System {
         }
     }
 
+    /// Последнее значение, записанное в INPTCTRL ($01).
+    pub fn inptctrl(&self) -> u8 {
+        self.inptctrl
+    }
+
     /// Сброс консоли. Картридж, BIOS и состояние переключателей сохраняются.
     pub fn reset(&mut self) {
         self.mem.ram.fill(0);

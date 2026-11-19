@@ -107,6 +107,34 @@ pub trait Host {
     }
 }
 
+/// Снимок внутреннего состояния — для панели отладки и поиска причин, почему игра не идёт.
+#[derive(Clone, Debug)]
+pub struct DebugInfo {
+    pub frames: u64,
+    pub nmi_count: u64,
+    pub pc: u16,
+    pub a: u8,
+    pub x: u8,
+    pub y: u8,
+    pub sp: u8,
+    pub p: u8,
+    pub maria_enabled: bool,
+    pub ctrl: u8,
+    pub dpp: u16,
+    pub charbase: u8,
+    pub background: u8,
+    pub inptctrl: u8,
+    pub bios_enabled: bool,
+    /// Сколько раз выполнен неофициальный опкод и какой был последним: (адрес, опкод).
+    pub unofficial_ops: u32,
+    pub last_unofficial: Option<(u16, u8)>,
+    /// Процессор завис на опкоде JAM: (адрес, опкод).
+    pub jam: Option<(u16, u8)>,
+    /// Сколько байтов графики MARIA пропустила (режим не реализован) и какой режим: (RM, WM).
+    pub unsupported_gfx_bytes: u32,
+    pub last_unsupported_mode: Option<(u8, bool)>,
+}
+
 pub struct Emulator {
     cpu: Cpu,
     sys: System,
@@ -114,6 +142,7 @@ pub struct Emulator {
     palette: Palette,
     carry: i32,
     frames: u64,
+    nmi_count: u64,
 }
 
 impl Emulator {
@@ -125,6 +154,7 @@ impl Emulator {
             palette: palette::ntsc(),
             carry: 0,
             frames: 0,
+            nmi_count: 0,
         }
     }
 
@@ -164,6 +194,32 @@ impl Emulator {
 
     pub fn frames_emulated(&self) -> u64 {
         self.frames
+    }
+
+    pub fn debug_info(&self) -> DebugInfo {
+        let m = &self.sys.maria;
+        DebugInfo {
+            frames: self.frames,
+            nmi_count: self.nmi_count,
+            pc: self.cpu.pc,
+            a: self.cpu.a,
+            x: self.cpu.x,
+            y: self.cpu.y,
+            sp: self.cpu.sp,
+            p: self.cpu.p,
+            maria_enabled: m.enabled,
+            ctrl: m.reg(0x3C),
+            dpp: ((m.reg(0x2C) as u16) << 8) | m.reg(0x30) as u16,
+            charbase: m.reg(0x34),
+            background: m.reg(0x20),
+            inptctrl: self.sys.inptctrl(),
+            bios_enabled: self.sys.mem.bios_enabled,
+            unofficial_ops: self.cpu.unofficial_count,
+            last_unofficial: self.cpu.last_unofficial,
+            jam: self.cpu.jam,
+            unsupported_gfx_bytes: m.unsupported_bytes,
+            last_unsupported_mode: m.last_unsupported,
+        }
     }
 
     pub fn input_mut(&mut self) -> &mut InputState {
@@ -207,6 +263,7 @@ impl Emulator {
 
             self.sys.riot.tick(dma as u32);
             if nmi {
+                self.nmi_count += 1;
                 let c = self.cpu.nmi(&mut self.sys);
                 self.sys.riot.tick(c);
                 carry -= c as i32;
@@ -283,6 +340,76 @@ mod tests {
         assert_eq!(emu.frames_emulated(), 2);
         assert!(!emu.take_audio().is_empty());
         assert_eq!(emu.frame().pixels.len(), SCREEN_W * SCREEN_H * 4);
+    }
+
+    /// Крошечный ROM, который включает MARIA и рисует зелёную полосу:
+    /// 14 зон по 16 строк, у первой флаг DLI (его обработчик увеличивает $1800).
+    fn tile_rom() -> Vec<u8> {
+        fn put(rom: &mut [u8], addr: usize, bytes: &[u8]) {
+            rom[addr - 0xC000..addr - 0xC000 + bytes.len()].copy_from_slice(bytes);
+        }
+        let (dll, dl, gfx, nmi) = (0xE000usize, 0xE100usize, 0xD000usize, 0xC100usize);
+        let mut rom = vec![0xEAu8; 0x4000];
+
+        let code = [
+            0x78, 0xD8, 0xA2, 0xFF, 0x9A, // SEI CLD LDX #$FF TXS
+            0xA9, 0x07, 0x85, 0x01, // INPTCTRL = 7
+            0xA9, 0x92, 0x85, 0x20, // фон
+            0xA9, 0xCA, 0x85, 0x23, // P0C3
+            0xA9, (dll >> 8) as u8, 0x85, 0x2C, // DPPH
+            0xA9, (dll & 0xFF) as u8, 0x85, 0x30, // DPPL
+            0xA9, 0x40, 0x85, 0x3C, // CTRL: DMA включён
+        ];
+        put(&mut rom, 0xC000, &code);
+        let spin = 0xC000 + code.len();
+        put(&mut rom, spin, &[0x4C, (spin & 0xFF) as u8, (spin >> 8) as u8]);
+        put(&mut rom, nmi, &[0xEE, 0x00, 0x18, 0x40]); // INC $1800 ; RTI
+
+        for z in 0..14 {
+            let flags = if z == 0 { 0x8F } else { 0x0F };
+            put(&mut rom, dll + z * 3, &[flags, (dl >> 8) as u8, (dl & 0xFF) as u8]);
+        }
+        // 4-байтовый заголовок: палитра 0, 4 байта графики, x = 20; затем конец списка
+        put(&mut rom, dl, &[0x00, 0x1C, (gfx >> 8) as u8, 20, 0x00, 0x00]);
+        for r in 0..16 {
+            put(&mut rom, gfx + r * 256, &[0xFF; 4]); // все точки — цвет 3
+        }
+        put(
+            &mut rom,
+            0xFFFA,
+            &[(nmi & 0xFF) as u8, (nmi >> 8) as u8, 0x00, 0xC0, (nmi & 0xFF) as u8, (nmi >> 8) as u8],
+        );
+        rom
+    }
+
+    fn px(emu: &Emulator, x: usize, y: usize) -> [u8; 3] {
+        let i = (y * SCREEN_W + x) * 4;
+        let p = &emu.frame().pixels;
+        [p[i], p[i + 1], p[i + 2]]
+    }
+
+    #[test]
+    fn maria_draws_display_list_and_fires_dli() {
+        let pal = palette::ntsc();
+        let mut emu = Emulator::new(Config::default());
+        emu.load_cartridge(&tile_rom()).unwrap();
+        for _ in 0..3 {
+            emu.run_frame();
+        }
+
+        // фон и полоса (x = 20 * 2 .. 20 * 2 + 32), с первой по последнюю строку
+        assert_eq!(px(&emu, 10, 5), pal[0x92]);
+        assert_eq!(px(&emu, 50, 0), pal[0xCA]);
+        assert_eq!(px(&emu, 71, 223), pal[0xCA]);
+        assert_eq!(px(&emu, 72, 100), pal[0x92]);
+
+        // по одному DLI на кадр
+        let d = emu.debug_info();
+        assert_eq!(d.nmi_count, 3);
+        assert_eq!(emu.sys.mem.peek(0x1800), 3);
+        assert_eq!(d.unofficial_ops, 0);
+        assert_eq!(d.unsupported_gfx_bytes, 0);
+        assert!(d.maria_enabled);
     }
 
     #[test]

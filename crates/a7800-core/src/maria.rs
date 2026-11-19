@@ -44,6 +44,10 @@ pub struct Maria {
     h8: bool,
     /// Буфер строки: 0 — прозрачно, иначе `палитра * 4 + цвет` (1..=31).
     line: [u8; SCREEN_W],
+    /// Сколько байтов графики пропущено из-за ещё не реализованного режима.
+    pub unsupported_bytes: u32,
+    /// (RM, WM) последнего неподдержанного режима.
+    pub last_unsupported: Option<(u8, bool)>,
 }
 
 impl Default for Maria {
@@ -65,7 +69,14 @@ impl Maria {
             h16: false,
             h8: false,
             line: [0; SCREEN_W],
+            unsupported_bytes: 0,
+            last_unsupported: None,
         }
+    }
+
+    /// Значение регистра для отладки (последнее записанное).
+    pub fn reg(&self, reg: u8) -> u8 {
+        self.regs[(reg & 0x3F) as usize]
     }
 
     /// Чтение регистра MARIA ($20–$3F).
@@ -245,7 +256,11 @@ impl Maria {
                 }
             }
             // TODO: 320B / 320C / 320D
-            _ => hx += 8,
+            _ => {
+                self.unsupported_bytes = self.unsupported_bytes.wrapping_add(1);
+                self.last_unsupported = Some((rm, wm));
+                hx += 8;
+            }
         }
         hx
     }

@@ -26,6 +26,13 @@ jobs:
         run: cargo clippy -p a7800-core --all-targets
       - name: Тесты
         run: cargo test -p a7800-core
+      - name: Функциональный тест 6502 (Klaus Dormann)
+        continue-on-error: true
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/6502_functional_test.bin" \
+            https://raw.githubusercontent.com/Klaus2m5/6502_65C02_functional_tests/master/bin_files/6502_functional_test.bin
+          A7800_FUNCTIONAL_TEST="$RUNNER_TEMP/6502_functional_test.bin" \
+            cargo test -p a7800-core --release --test functional -- --nocapture
 
   web:
     needs: test
@@ -41,6 +48,8 @@ jobs:
           version: latest
       - name: Сборка wasm
         run: wasm-pack build crates/a7800-web --target web --release --out-dir ../../web/pkg
+      - name: Проверка собранного wasm (тестовый ROM → кадр и звук)
+        run: node tests/smoke.mjs
       - name: Убираем служебные файлы
         run: rm -f web/pkg/.gitignore web/pkg/package.json web/pkg/README.md
       - uses: actions/upload-pages-artifact@v3
