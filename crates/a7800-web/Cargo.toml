@@ -1,0 +1,18 @@
+[package]
+name = "a7800-web"
+version = "0.1.0"
+edition = "2021"
+description = "WebAssembly-обёртка над a7800-core"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+a7800-core = { path = "../a7800-core" }
+wasm-bindgen = "0.2"
+serde_json = "1"
+console_error_panic_hook = "0.1"
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false

@@ -1,0 +1,8 @@
+[package]
+name = "a7800-core"
+version = "0.1.0"
+edition = "2021"
+description = "Ядро эмулятора Atari 7800: библиотека без зависимостей и без привязки к платформе"
+license = "MIT"
+
+[dependencies]
