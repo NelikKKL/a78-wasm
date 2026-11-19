@@ -3,9 +3,10 @@
 //! Модель упрощённая: формы волн строятся на полиномиальных счётчиках
 //! (LFSR 4/5/9 бит) и делителях, а не по точным таблицам TIA.
 //! Высота тона верна, тембр шумовых режимов приблизительный.
+//! Миксование и ресемплинг делает `System::advance`.
 
-/// Частота тактирования звука TIA (≈ 3.579545 МГц / 114).
-pub const AUDIO_CLOCK_HZ: f32 = 31_399.5;
+/// Во сколько тактов процессора укладывается один такт звука TIA (≈ 31.4 кГц).
+pub const CYCLES_PER_AUDIO_TICK: u32 = 57;
 
 #[derive(Clone)]
 struct Channel {
@@ -95,32 +96,21 @@ impl Channel {
 
 pub struct Tia {
     ch: [Channel; 2],
-    sample_rate: f32,
-    phase: f32,
-    last_in: f32,
-    dc: f32,
-    /// Накопленные моно-сэмплы f32 в диапазоне примерно [-1, 1].
-    pub samples: Vec<f32>,
+}
+
+impl Default for Tia {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Tia {
-    pub fn new(sample_rate: u32) -> Self {
-        Self {
-            ch: [Channel::new(), Channel::new()],
-            sample_rate: sample_rate as f32,
-            phase: 0.0,
-            last_in: 0.0,
-            dc: 0.0,
-            samples: Vec::new(),
-        }
+    pub fn new() -> Self {
+        Self { ch: [Channel::new(), Channel::new()] }
     }
 
     pub fn reset(&mut self) {
         self.ch = [Channel::new(), Channel::new()];
-        self.phase = 0.0;
-        self.last_in = 0.0;
-        self.dc = 0.0;
-        self.samples.clear();
     }
 
     /// Запись в регистры звука: $15 AUDC0, $16 AUDC1, $17 AUDF0, $18 AUDF1, $19 AUDV0, $1A AUDV1.
@@ -136,22 +126,15 @@ impl Tia {
         }
     }
 
-    /// Один такт звука. Вызывается дважды на строку развёртки.
-    pub fn tick_audio(&mut self) {
+    /// Один такт звука (≈ 31.4 кГц).
+    pub fn clock(&mut self) {
         for c in &mut self.ch {
             c.clock();
         }
-        let mix = (self.ch[0].level() + self.ch[1].level()) as f32 / 30.0;
+    }
 
-        // Простой фильтр, убирающий постоянную составляющую
-        let y = mix - self.last_in + 0.995 * self.dc;
-        self.last_in = mix;
-        self.dc = y;
-
-        self.phase += self.sample_rate / AUDIO_CLOCK_HZ;
-        while self.phase >= 1.0 {
-            self.phase -= 1.0;
-            self.samples.push(y);
-        }
+    /// Текущий уровень звука 0.0 … 1.0.
+    pub fn level(&self) -> f32 {
+        (self.ch[0].level() + self.ch[1].level()) as f32 / 30.0
     }
 }

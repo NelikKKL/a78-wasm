@@ -46,6 +46,12 @@ impl Riot {
         }
     }
 
+    /// Выведена ли линия порта B в ноль (бит `mask` — выход со значением 0).
+    /// Так игра включает режим двух кнопок на PB2 (джойстик 0) и PB4 (джойстик 1).
+    pub fn port_b_driven_low(&self, mask: u8) -> bool {
+        self.ddrb & mask != 0 && self.swchb_out & mask == 0
+    }
+
     pub fn ram_read(&self, addr: u16) -> u8 {
         self.ram[(addr & 0x7F) as usize]
     }

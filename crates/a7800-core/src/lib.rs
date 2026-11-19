@@ -30,6 +30,7 @@ pub mod cpu;
 pub mod input;
 pub mod maria;
 pub mod palette;
+pub mod pokey;
 pub mod riot;
 pub mod system;
 pub mod tia;
@@ -162,7 +163,9 @@ impl Emulator {
     pub fn load_cartridge(&mut self, data: &[u8]) -> Result<CartInfo, LoadError> {
         let cart = Cartridge::from_bytes(data)?;
         let info = CartInfo { title: cart.title.clone(), mapper: cart.mapper, rom_size: cart.rom_len() };
+        let pokey_at = cart.pokey_at;
         self.sys.mem.cart = Some(cart);
+        self.sys.pokey_base = pokey_at;
         self.reset();
         Ok(info)
     }
@@ -233,7 +236,7 @@ impl Emulator {
 
     /// Забирает накопленные звуковые сэмплы.
     pub fn take_audio(&mut self) -> Vec<f32> {
-        std::mem::take(&mut self.sys.tia.samples)
+        self.sys.take_audio()
     }
 
     /// Эмулирует один кадр (262 строки).
@@ -261,11 +264,11 @@ impl Emulator {
                 nmi = info.nmi;
             }
 
-            self.sys.riot.tick(dma as u32);
+            self.sys.advance(dma as u32);
             if nmi {
                 self.nmi_count += 1;
                 let c = self.cpu.nmi(&mut self.sys);
-                self.sys.riot.tick(c);
+                self.sys.advance(c);
                 carry -= c as i32;
             }
 
@@ -274,7 +277,7 @@ impl Emulator {
             let mut budget = CYCLES_PER_LINE - dma + carry;
             while budget > 0 {
                 let c = self.cpu.step(&mut self.sys) as i32;
-                self.sys.riot.tick(c as u32);
+                self.sys.advance(c as u32);
                 budget -= c;
                 if self.sys.wsync {
                     break;
@@ -282,16 +285,12 @@ impl Emulator {
             }
             if self.sys.wsync {
                 if budget > 0 {
-                    self.sys.riot.tick(budget as u32);
+                    self.sys.advance(budget as u32);
                 }
                 carry = 0;
             } else {
                 carry = budget.max(-CYCLES_PER_LINE);
             }
-
-            // Звук TIA тактируется ~31.4 кГц — это два раза на строку.
-            self.sys.tia.tick_audio();
-            self.sys.tia.tick_audio();
         }
 
         self.carry = carry;
@@ -365,10 +364,14 @@ mod tests {
         put(&mut rom, spin, &[0x4C, (spin & 0xFF) as u8, (spin >> 8) as u8]);
         put(&mut rom, nmi, &[0xEE, 0x00, 0x18, 0x40]); // INC $1800 ; RTI
 
-        for z in 0..14 {
+        for z in 0..15 {
             let flags = if z == 0 { 0x8F } else { 0x0F };
-            put(&mut rom, dll + z * 3, &[flags, (dl >> 8) as u8, (dl & 0xFF) as u8]);
+            // последняя зона указывает на пустой список отображения
+            let list = if z == 14 { dl + 0x40 } else { dl };
+            put(&mut rom, dll + z * 3, &[flags, (list >> 8) as u8, (list & 0xFF) as u8]);
         }
+        put(&mut rom, dll + 15 * 3, &[0, 0, 0]); // следующая запись без DLI
+        put(&mut rom, dl + 0x40, &[0, 0]); // пустой список
         // 4-байтовый заголовок: палитра 0, 4 байта графики, x = 20; затем конец списка
         put(&mut rom, dl, &[0x00, 0x1C, (gfx >> 8) as u8, 20, 0x00, 0x00]);
         for r in 0..16 {
@@ -402,6 +405,7 @@ mod tests {
         assert_eq!(px(&emu, 50, 0), pal[0xCA]);
         assert_eq!(px(&emu, 71, 223), pal[0xCA]);
         assert_eq!(px(&emu, 72, 100), pal[0x92]);
+        assert_eq!(px(&emu, 50, 239), pal[0x92]); // пустая последняя зона — только фон
 
         // по одному DLI на кадр
         let d = emu.debug_info();
