@@ -52,16 +52,65 @@ pub const LINES_PER_FRAME: usize = 262;
 pub const ACTIVE_START: usize = 16;
 /// Частота кадров NTSC.
 pub const FRAME_RATE: f64 = 59.92;
+/// Высота кадра в режиме PAL.
+pub const SCREEN_H_PAL: usize = 288;
+
+/// Телевизионный стандарт: определяет число строк, частоту процессора и размер кадра.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Region {
+    Ntsc,
+    Pal,
+}
+
+impl Region {
+    pub fn name(self) -> &'static str {
+        match self {
+            Region::Ntsc => "NTSC",
+            Region::Pal => "PAL",
+        }
+    }
+
+    /// Строк развёртки в кадре.
+    pub fn lines(self) -> usize {
+        match self {
+            Region::Ntsc => 262,
+            Region::Pal => 312,
+        }
+    }
+
+    /// Тактовая частота процессора, Гц.
+    pub fn cpu_hz(self) -> f32 {
+        match self {
+            Region::Ntsc => system::CPU_HZ,
+            Region::Pal => 1_773_447.0,
+        }
+    }
+
+    /// Высота видимой части кадра в пикселях.
+    pub fn screen_height(self) -> usize {
+        match self {
+            Region::Ntsc => SCREEN_H,
+            Region::Pal => SCREEN_H_PAL,
+        }
+    }
+
+    /// Частота кадров: 59.92 Гц для NTSC и 49.86 Гц для PAL.
+    pub fn frame_rate(self) -> f64 {
+        self.cpu_hz() as f64 / (self.lines() as f64 * CYCLES_PER_LINE as f64)
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Config {
     /// Частота дискретизации выходного звука.
     pub sample_rate: u32,
+    /// Принудительный регион. `None` — определять по заголовку картриджа (по умолчанию NTSC).
+    pub region: Option<Region>,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { sample_rate: 48_000 }
+        Self { sample_rate: 48_000, region: None }
     }
 }
 
@@ -74,12 +123,12 @@ pub struct FrameBuffer {
 }
 
 impl FrameBuffer {
-    fn new() -> Self {
-        let mut pixels = vec![0u8; SCREEN_W * SCREEN_H * 4];
+    fn new(height: usize) -> Self {
+        let mut pixels = vec![0u8; SCREEN_W * height * 4];
         for px in pixels.chunks_exact_mut(4) {
             px[3] = 255;
         }
-        Self { width: SCREEN_W, height: SCREEN_H, pixels }
+        Self { width: SCREEN_W, height, pixels }
     }
 }
 
@@ -128,6 +177,12 @@ pub struct DebugInfo {
     pub bios_enabled: bool,
     /// Схема банков, размер ROM, RAM и POKEY картриджа.
     pub cart: String,
+    /// Текущий банк и последние записи в ROM-пространство.
+    pub cart_state: String,
+    pub region: Region,
+    /// Последние инструкции перед первым неофициальным опкодом / перед JAM: (адрес, опкод).
+    pub first_unofficial_trace: Option<Vec<(u16, u8)>>,
+    pub jam_trace: Option<Vec<(u16, u8)>>,
     /// Сколько раз выполнен неофициальный опкод и какой был последним: (адрес, опкод).
     pub unofficial_ops: u32,
     pub last_unofficial: Option<(u16, u8)>,
@@ -146,19 +201,49 @@ pub struct Emulator {
     carry: i32,
     frames: u64,
     nmi_count: u64,
+    region: Region,
+    forced_region: Option<Region>,
 }
 
 impl Emulator {
     pub fn new(config: Config) -> Self {
-        Self {
+        let mut emu = Self {
             cpu: Cpu::new(),
             sys: System::new(config.sample_rate),
-            frame: FrameBuffer::new(),
+            frame: FrameBuffer::new(SCREEN_H),
             palette: palette::ntsc(),
             carry: 0,
             frames: 0,
             nmi_count: 0,
+            region: Region::Ntsc,
+            forced_region: config.region,
+        };
+        if let Some(r) = config.region {
+            emu.apply_region(r);
         }
+        emu
+    }
+
+    fn apply_region(&mut self, region: Region) {
+        self.region = region;
+        self.frame = FrameBuffer::new(region.screen_height());
+        self.sys.set_cpu_hz(region.cpu_hz());
+    }
+
+    pub fn region(&self) -> Region {
+        self.region
+    }
+
+    /// Принудительно выбирает регион (иначе берётся из заголовка картриджа).
+    /// Размер кадра меняется, поэтому после вызова перечитайте `frame().height`.
+    pub fn set_region(&mut self, region: Region) {
+        self.forced_region = Some(region);
+        self.apply_region(region);
+    }
+
+    /// Частота кадров текущего региона, Гц.
+    pub fn frame_rate(&self) -> f64 {
+        self.region.frame_rate()
     }
 
     /// Загружает картридж (.a78 или "сырой" образ) и перезапускает консоль.
@@ -166,7 +251,9 @@ impl Emulator {
         let cart = Cartridge::from_bytes(data)?;
         let info = CartInfo { title: cart.title.clone(), mapper: cart.mapper, rom_size: cart.rom_len() };
         let pokey_at = cart.pokey_at.clone();
+        let region = self.forced_region.unwrap_or(if cart.pal { Region::Pal } else { Region::Ntsc });
         self.sys.mem.cart = Some(cart);
+        self.apply_region(region);
         self.sys.pokey_bases = pokey_at;
         self.reset();
         Ok(info)
@@ -225,6 +312,10 @@ impl Emulator {
             inptctrl: self.sys.inptctrl(),
             bios_enabled: self.sys.mem.bios_enabled,
             cart: self.cart_description(),
+            cart_state: self.sys.mem.cart.as_ref().map_or_else(String::new, |c| c.state()),
+            region: self.region,
+            first_unofficial_trace: self.cpu.first_unofficial_trace.clone(),
+            jam_trace: self.cpu.jam_trace.clone(),
             unofficial_ops: self.cpu.unofficial_count,
             last_unofficial: self.cpu.last_unofficial,
             jam: self.cpu.jam,
@@ -255,8 +346,10 @@ impl Emulator {
         self.sys.sync_ports();
         let mut carry = self.carry;
 
-        for line in 0..LINES_PER_FRAME {
-            let active = (ACTIVE_START..ACTIVE_START + SCREEN_H).contains(&line);
+        let lines = self.region.lines();
+        let height = self.frame.height;
+        for line in 0..lines {
+            let active = (ACTIVE_START..ACTIVE_START + height).contains(&line);
             self.sys.maria.vblank = !active;
             if line == ACTIVE_START {
                 self.sys.maria.start_frame();
@@ -410,8 +503,11 @@ mod tests {
 
         // фон и полоса (x = 20 * 2 .. 20 * 2 + 32), с первой по последнюю строку
         assert_eq!(px(&emu, 10, 5), pal[0x92]);
-        assert_eq!(px(&emu, 50, 0), pal[0xCA]);
-        assert_eq!(px(&emu, 71, 223), pal[0xCA]);
+        // линейный буфер двойной: первая строка кадра пустая, картинка отстаёт от DMA на строку
+        assert_eq!(px(&emu, 50, 0), pal[0x92]);
+        assert_eq!(px(&emu, 50, 1), pal[0xCA]);
+        assert_eq!(px(&emu, 71, 224), pal[0xCA]);
+        assert_eq!(px(&emu, 50, 225), pal[0x92]);
         assert_eq!(px(&emu, 72, 100), pal[0x92]);
         assert_eq!(px(&emu, 50, 239), pal[0x92]); // пустая последняя зона — только фон
 
@@ -437,6 +533,32 @@ mod tests {
         let d = emu.debug_info();
         assert_eq!(d.pc, 0xC000);
         assert!(d.cart.contains("SuperGame") && d.cart.contains("128"), "{}", d.cart);
+    }
+
+    /// ROM в формате .a78 с заголовком, где байт 57 = 1 (PAL).
+    #[test]
+    fn pal_header_switches_region() {
+        let rom = spin_rom();
+        let mut data = vec![0u8; 128];
+        data[1..10].copy_from_slice(b"ATARI7800");
+        data[49..53].copy_from_slice(&(rom.len() as u32).to_be_bytes());
+        data[57] = 1;
+        data.extend(&rom);
+
+        let mut emu = Emulator::new(Config::default());
+        emu.load_cartridge(&data).unwrap();
+        assert_eq!(emu.region(), Region::Pal);
+        assert_eq!(emu.frame().height, SCREEN_H_PAL);
+        assert!((emu.frame_rate() - 49.86).abs() < 0.05);
+
+        emu.run_frame();
+        let n = emu.take_audio().len();
+        assert!((955..970).contains(&n), "за кадр PAL получено {n} сэмплов");
+
+        // обычный картридж без заголовка — снова NTSC
+        emu.load_cartridge(&rom).unwrap();
+        assert_eq!(emu.region(), Region::Ntsc);
+        assert_eq!(emu.frame().height, SCREEN_H);
     }
 
     #[test]

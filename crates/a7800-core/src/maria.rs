@@ -13,7 +13,10 @@
 //!
 //! Тайминг: DMA считается в тактах MARIA (7.16 МГц), на один такт процессора их 4.
 //!
-//! Упрощения: нет задержки на одну строку (буфер не двойной), не рисуется рамка (BC).
+//! Линейная RAM двойная: пока MARIA строит строку N, на экран выводится строка N-1,
+//! поэтому картинка отстаёт от DMA на одну строку, а первая строка кадра пустая.
+//!
+//! Упрощение: рамка (бит BC) не рисуется — кадр содержит только активную область.
 
 use crate::palette::Palette;
 use crate::system::Memory;
@@ -55,7 +58,10 @@ pub struct Maria {
     first_zone: bool,
     /// Режим записи запоминается между заголовками, строками и кадрами.
     write_mode: bool,
+    /// Строится на текущей строке.
     cells: [u8; CELLS],
+    /// Выводится на экран на текущей строке (построена на предыдущей).
+    shown: [u8; CELLS],
     /// Сколько раз использован недопустимый режим чтения (RM = 1).
     pub unsupported_bytes: u32,
     /// (RM, WM) последнего недопустимого режима.
@@ -83,6 +89,7 @@ impl Maria {
             first_zone: true,
             write_mode: false,
             cells: [0; CELLS],
+            shown: [0; CELLS],
             unsupported_bytes: 0,
             last_unsupported: None,
         }
@@ -110,14 +117,18 @@ impl Maria {
         self.dll = ((self.regs[DPPH] as u16) << 8) | self.regs[DPPL] as u16;
         self.zone_left = 0;
         self.first_zone = true;
+        self.shown.fill(0);
     }
 
     /// Строит одну строку и записывает её в `row` (RGBA, `SCREEN_W * 4` байт).
     pub fn render_line(&mut self, mem: &Memory, row: &mut [u8], palette: &Palette) -> LineInfo {
         let mut info = LineInfo::default();
-        self.cells.fill(0);
-
         let ctrl = self.regs[CTRL];
+
+        // На экран идёт то, что построено на предыдущей строке, с текущими палитрой и режимом чтения
+        self.blit(row, palette, ctrl);
+
+        self.cells.fill(0);
         if self.enabled && (ctrl & 0x60) == 0x40 {
             let mut clocks = 16u32; // запуск DMA
             if self.zone_left == 0 {
@@ -148,7 +159,7 @@ impl Maria {
             self.unsupported_bytes = self.unsupported_bytes.wrapping_add(1);
             self.last_unsupported = Some((1, self.write_mode));
         }
-        self.blit(row, palette, ctrl);
+        self.shown = self.cells;
         info
     }
 
@@ -282,7 +293,7 @@ impl Maria {
             palette[c as usize]
         };
 
-        for (i, &c) in self.cells.iter().enumerate() {
+        for (i, &c) in self.shown.iter().enumerate() {
             let (d0, d1) = match rm {
                 // 160A/160B: оба пикселя одинаковые
                 0 | 1 => (c, c),
@@ -354,20 +365,20 @@ mod tests {
         let mut row = vec![0u8; SCREEN_W * 4];
 
         // 320A (RM=3): ячейка P=001, C=11 → оба пикселя "палитра 1, цвет 2"
-        m.cells[0] = 0b00111;
+        m.shown[0] = 0b00111;
         m.blit(&mut row, &pal, 0x03);
         assert_eq!(rgb(&row, 0), pal[0x46]);
         assert_eq!(rgb(&row, 1), pal[0x46]);
 
         // 320D/320B (RM=2): P1 P0 → младшие биты цвета; ячейка P=010, C=10:
         // пиксель 0: цвет (C1, P1) = (1, 1) = 3, пиксель 1: (C0, P0) = (0, 0) = 0 → фон
-        m.cells[0] = 0b01010;
+        m.shown[0] = 0b01010;
         m.blit(&mut row, &pal, 0x02);
         assert_eq!(rgb(&row, 0), pal[0xCA]);
         assert_eq!(rgb(&row, 1), pal[0x92]);
 
         // 160 (RM=0): обе точки одинаковые
-        m.cells[0] = 0b00010; // палитра 0, цвет 2
+        m.shown[0] = 0b00010; // палитра 0, цвет 2
         m.blit(&mut row, &pal, 0x00);
         assert_eq!(rgb(&row, 0), pal[0x1E]);
         assert_eq!(rgb(&row, 1), pal[0x1E]);

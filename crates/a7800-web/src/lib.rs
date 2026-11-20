@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use a7800_core::{Action, Bindings, Config, Emulator, SCREEN_H, SCREEN_W};
+use a7800_core::{Action, Bindings, Config, Emulator, SCREEN_W};
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen(start)]
@@ -25,7 +25,7 @@ pub struct Console {
 impl Console {
     #[wasm_bindgen(constructor)]
     pub fn new(sample_rate: u32) -> Console {
-        Console { emu: Emulator::new(Config { sample_rate }), bindings: Bindings::default() }
+        Console { emu: Emulator::new(Config { sample_rate, ..Config::default() }), bindings: Bindings::default() }
     }
 
     /// Загружает картридж, возвращает название из заголовка (может быть пустым).
@@ -61,7 +61,12 @@ impl Console {
     }
 
     pub fn frame_height(&self) -> u32 {
-        SCREEN_H as u32
+        self.emu.frame().height as u32
+    }
+
+    /// Частота кадров текущего региона (59.92 для NTSC, 49.86 для PAL).
+    pub fn frame_rate(&self) -> f64 {
+        self.emu.frame_rate()
     }
 
     /// Звук за прошедшие кадры (Float32Array, моно).
@@ -76,6 +81,18 @@ impl Console {
             Some((pc, op)) => format!(" (последний: {op:02X} по адресу {pc:04X})"),
             None => String::new(),
         };
+        let trace = |t: &Option<Vec<(u16, u8)>>| match t {
+            Some(v) => v.iter().map(|(pc, op)| format!("{pc:04X}:{op:02X}")).collect::<Vec<_>>().join(" "),
+            None => String::new(),
+        };
+        let unofficial_trace = match &d.first_unofficial_trace {
+            Some(_) => format!("\nдо первого неофициального опкода: {}", trace(&d.first_unofficial_trace)),
+            None => String::new(),
+        };
+        let jam_trace = match &d.jam_trace {
+            Some(_) => format!("\nперед зависанием: {}", trace(&d.jam_trace)),
+            None => String::new(),
+        };
         let jam = match d.jam {
             Some((pc, op)) => format!("\n!!! процессор завис на опкоде {op:02X} по адресу {pc:04X}"),
             None => String::new(),
@@ -86,6 +103,8 @@ impl Console {
         };
         format!(
             "картридж: {}\n\
+             банки: {}\n\
+             регион: {}, {:.2} Гц\n\
              кадр {}, NMI {}\n\
              PC={:04X} A={:02X} X={:02X} Y={:02X} SP={:02X} P={:02X}\n\
              MARIA: {}, CTRL={:02X}, DPP={:04X}, CHARBASE={:02X}, фон={:02X}\n\
@@ -93,6 +112,9 @@ impl Console {
              неофициальных опкодов выполнено: {}{}\n\
              строк с недопустимым режимом чтения MARIA (RM=1): {}{}{}",
             d.cart,
+            d.cart_state,
+            d.region.name(),
+            d.region.frame_rate(),
             d.frames,
             d.nmi_count,
             d.pc,
@@ -113,7 +135,8 @@ impl Console {
             d.unsupported_gfx_bytes,
             unsupported,
             jam,
-        )
+        ) + &unofficial_trace
+            + &jam_trace
     }
 
     // ---- управление ----

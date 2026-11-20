@@ -80,6 +80,13 @@ pub struct Cpu {
     pub last_unofficial: Option<(u16, u8)>,
     /// Процессор "завис" на опкоде JAM/KIL: (адрес, опкод). Выйти можно только сбросом.
     pub jam: Option<(u16, u8)>,
+    /// Последние 16 инструкций до первого неофициального опкода (адрес, опкод), старые первыми.
+    /// Нужны, чтобы понять, как выполнение попало туда: ушло в данные, не тот банк и т. п.
+    pub first_unofficial_trace: Option<Vec<(u16, u8)>>,
+    /// То же перед зависанием на JAM.
+    pub jam_trace: Option<Vec<(u16, u8)>>,
+    history: [(u16, u8); 16],
+    hist_pos: usize,
     op_pc: u16,
     op: u8,
 }
@@ -96,6 +103,10 @@ impl Default for Cpu {
             unofficial_count: 0,
             last_unofficial: None,
             jam: None,
+            first_unofficial_trace: None,
+            jam_trace: None,
+            history: [(0, 0); 16],
+            hist_pos: 0,
             op_pc: 0,
             op: 0,
         }
@@ -112,6 +123,11 @@ impl Cpu {
         self.sp = 0xFD;
         self.p = FI | FU;
         self.jam = None;
+        self.unofficial_count = 0;
+        self.last_unofficial = None;
+        self.first_unofficial_trace = None;
+        self.jam_trace = None;
+        self.hist_pos = 0;
         self.pc = read16(bus, 0xFFFC);
     }
 
@@ -143,6 +159,13 @@ impl Cpu {
 
     fn jam_cpu(&mut self) {
         self.jam = Some((self.op_pc, self.op));
+        self.jam_trace = Some(self.recent_instructions());
+    }
+
+    /// Последние выполненные инструкции (адрес, опкод), старые первыми; не больше 16.
+    pub fn recent_instructions(&self) -> Vec<(u16, u8)> {
+        let n = self.hist_pos.min(16);
+        (0..n).map(|i| self.history[(self.hist_pos - n + i) & 15]).collect()
     }
 
     /// Запись для SHA/SHX/SHY/TAS: значение И (старший байт базового адреса + 1);
@@ -157,6 +180,9 @@ impl Cpu {
     fn flag_unofficial(&mut self) {
         self.unofficial_count = self.unofficial_count.wrapping_add(1);
         self.last_unofficial = Some((self.op_pc, self.op));
+        if self.first_unofficial_trace.is_none() {
+            self.first_unofficial_trace = Some(self.recent_instructions());
+        }
     }
 
     fn fetch<T: Bus>(&mut self, bus: &mut T) -> u8 {
@@ -356,6 +382,8 @@ impl Cpu {
         self.op_pc = self.pc;
         let op = self.fetch(bus);
         self.op = op;
+        self.history[self.hist_pos & 15] = (self.op_pc, op);
+        self.hist_pos = self.hist_pos.wrapping_add(1);
         match op {
             0x00 => {
                 // BRK
@@ -1038,6 +1066,15 @@ mod tests {
         let (cpu, _) = run(&prog, 7);
         assert_eq!(cpu.a, 0x7F);
         assert_eq!(cpu.pc, 0x0200 + prog.len() as u16);
+    }
+
+    #[test]
+    fn trace_before_first_unofficial_opcode() {
+        // LDA #1 ; TAX ; NOP-неофициальный (0x1A)
+        let (cpu, _) = run(&[0xA9, 0x01, 0xAA, 0x1A], 3);
+        let t = cpu.first_unofficial_trace.clone().unwrap();
+        assert_eq!(t, vec![(0x0200, 0xA9), (0x0202, 0xAA), (0x0203, 0x1A)]);
+        assert_eq!(cpu.unofficial_count, 1);
     }
 
     #[test]

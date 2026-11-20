@@ -96,6 +96,7 @@ impl Default for Memory {
 /// Выход звука: микширует TIA и POKEY и ресемплирует до частоты хоста.
 struct AudioOut {
     sample_rate: f32,
+    cpu_hz: f32,
     phase: f32,
     tia_div: u32,
     pokey_acc: f32,
@@ -109,6 +110,7 @@ impl AudioOut {
     fn new(sample_rate: u32) -> Self {
         Self {
             sample_rate: sample_rate as f32,
+            cpu_hz: CPU_HZ,
             phase: 0.0,
             tia_div: 0,
             pokey_acc: 0.0,
@@ -120,7 +122,9 @@ impl AudioOut {
     }
 
     fn reset(&mut self) {
-        *self = Self::new(self.sample_rate as u32);
+        let (rate, hz) = (self.sample_rate as u32, self.cpu_hz);
+        *self = Self::new(rate);
+        self.cpu_hz = hz;
     }
 }
 
@@ -157,6 +161,11 @@ impl System {
         }
     }
 
+    /// Тактовая частота процессора для расчёта звука (зависит от региона).
+    pub fn set_cpu_hz(&mut self, hz: f32) {
+        self.audio.cpu_hz = hz;
+    }
+
     /// Последнее значение, записанное в INPTCTRL ($01).
     pub fn inptctrl(&self) -> u8 {
         self.inptctrl
@@ -185,7 +194,7 @@ impl System {
     pub fn advance(&mut self, cycles: u32) {
         self.riot.tick(cycles);
 
-        let step = self.audio.sample_rate / CPU_HZ;
+        let step = self.audio.sample_rate / self.audio.cpu_hz;
         for _ in 0..cycles {
             self.audio.tia_div += 1;
             if self.audio.tia_div >= CYCLES_PER_AUDIO_TICK {

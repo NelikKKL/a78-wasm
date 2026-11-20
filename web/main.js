@@ -4,7 +4,7 @@ import init, { Console } from "./pkg/a7800_web.js";
 import { buildTestRom } from "./testrom.js";
 
 const SAMPLE_RATE = 48000;
-const FRAME_MS = 1000 / 59.92;
+let frameMs = 1000 / 59.92; // меняется по региону картриджа (NTSC 59.92, PAL 49.86)
 const LS_BINDINGS = "a7800.bindings";
 
 const canvas = document.getElementById("screen");
@@ -127,10 +127,10 @@ function tick(now) {
 
   acc += dt;
   let ran = false;
-  while (acc >= FRAME_MS) {
+  while (acc >= frameMs) {
     con.run_frame();
     pushAudio(con.take_audio());
-    acc -= FRAME_MS;
+    acc -= frameMs;
     ran = true;
   }
   if (ran) draw();
@@ -149,6 +149,9 @@ function startCartridge(data, name) {
     loaded = true;
     paused = false;
     acc = 0;
+    // PAL-картридж — другой размер кадра и другая частота
+    canvas.height = con.frame_height();
+    frameMs = 1000 / con.frame_rate();
     setStatus(`${title || name} — ${con.cart_description()}`);
   } catch (e) {
     setStatus(`Не удалось открыть «${name}»: ${e.message ?? e}`);
