@@ -126,6 +126,8 @@ pub struct DebugInfo {
     pub background: u8,
     pub inptctrl: u8,
     pub bios_enabled: bool,
+    /// Схема банков, размер ROM, RAM и POKEY картриджа.
+    pub cart: String,
     /// Сколько раз выполнен неофициальный опкод и какой был последним: (адрес, опкод).
     pub unofficial_ops: u32,
     pub last_unofficial: Option<(u16, u8)>,
@@ -163,9 +165,9 @@ impl Emulator {
     pub fn load_cartridge(&mut self, data: &[u8]) -> Result<CartInfo, LoadError> {
         let cart = Cartridge::from_bytes(data)?;
         let info = CartInfo { title: cart.title.clone(), mapper: cart.mapper, rom_size: cart.rom_len() };
-        let pokey_at = cart.pokey_at;
+        let pokey_at = cart.pokey_at.clone();
         self.sys.mem.cart = Some(cart);
-        self.sys.pokey_base = pokey_at;
+        self.sys.pokey_bases = pokey_at;
         self.reset();
         Ok(info)
     }
@@ -199,6 +201,11 @@ impl Emulator {
         self.frames
     }
 
+    /// Что за картридж загружен: схема банков, размер, RAM, POKEY.
+    pub fn cart_description(&self) -> String {
+        self.sys.mem.cart.as_ref().map_or_else(|| "нет".to_string(), |c| c.describe())
+    }
+
     pub fn debug_info(&self) -> DebugInfo {
         let m = &self.sys.maria;
         DebugInfo {
@@ -217,6 +224,7 @@ impl Emulator {
             background: m.reg(0x20),
             inptctrl: self.sys.inptctrl(),
             bios_enabled: self.sys.mem.bios_enabled,
+            cart: self.cart_description(),
             unofficial_ops: self.cpu.unofficial_count,
             last_unofficial: self.cpu.last_unofficial,
             jam: self.cpu.jam,
@@ -414,6 +422,21 @@ mod tests {
         assert_eq!(d.unofficial_ops, 0);
         assert_eq!(d.unsupported_gfx_bytes, 0);
         assert!(d.maria_enabled);
+    }
+
+    /// 128 КБ без заголовка: SuperGame, код в последнем банке.
+    #[test]
+    fn raw_128k_rom_runs_from_last_bank() {
+        let mut rom = vec![0xEAu8; 0x20000];
+        rom[0x1C000..0x1C003].copy_from_slice(&[0x4C, 0x00, 0xC0]); // $C000: JMP $C000
+        rom[0x1FFFA..0x20000].copy_from_slice(&[0x00, 0xC1, 0x00, 0xC0, 0x00, 0xC1]);
+        let mut emu = Emulator::new(Config::default());
+        emu.load_cartridge(&rom).unwrap();
+        emu.run_frame();
+        emu.run_frame();
+        let d = emu.debug_info();
+        assert_eq!(d.pc, 0xC000);
+        assert!(d.cart.contains("SuperGame") && d.cart.contains("128"), "{}", d.cart);
     }
 
     #[test]

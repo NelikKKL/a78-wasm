@@ -129,9 +129,9 @@ pub struct System {
     pub maria: Maria,
     pub riot: Riot,
     pub tia: Tia,
-    /// POKEY на картридже (если есть) и его адрес.
-    pub pokey: Option<Pokey>,
-    pub pokey_base: Option<u16>,
+    /// Адреса POKEY, которые просит картридж ($4000, $0450, $0440, $0800).
+    pub pokey_bases: Vec<u16>,
+    pokeys: Vec<(u16, Pokey)>,
     pub input: InputState,
     audio: AudioOut,
     inptctrl: u8,
@@ -147,8 +147,8 @@ impl System {
             maria: Maria::new(),
             riot: Riot::new(),
             tia: Tia::new(),
-            pokey: None,
-            pokey_base: None,
+            pokey_bases: Vec::new(),
+            pokeys: Vec::new(),
             input: InputState::default(),
             audio: AudioOut::new(sample_rate),
             inptctrl: 0,
@@ -168,7 +168,7 @@ impl System {
         self.maria = Maria::new();
         self.riot = Riot::new();
         self.tia.reset();
-        self.pokey = self.pokey_base.map(|_| Pokey::new());
+        self.pokeys = self.pokey_bases.iter().map(|&b| (b, Pokey::new())).collect();
         self.audio.reset();
         self.inptctrl = 0;
         self.locked = false;
@@ -192,7 +192,7 @@ impl System {
                 self.audio.tia_div = 0;
                 self.tia.clock();
             }
-            if let Some(p) = self.pokey.as_mut() {
+            for (_, p) in self.pokeys.iter_mut() {
                 p.clock();
                 self.audio.pokey_acc += p.level();
             }
@@ -201,12 +201,12 @@ impl System {
             self.audio.phase += step;
             if self.audio.phase >= 1.0 {
                 self.audio.phase -= 1.0;
-                let mix = match self.pokey {
-                    Some(_) => {
-                        let pk = self.audio.pokey_acc / self.audio.pokey_n as f32;
-                        (self.tia.level() + pk) * 0.5
-                    }
-                    None => self.tia.level(),
+                let mix = if self.pokeys.is_empty() {
+                    self.tia.level()
+                } else {
+                    // среднее за интервал и среднее по микросхемам
+                    let pk = self.audio.pokey_acc / (self.audio.pokey_n as f32 * self.pokeys.len() as f32);
+                    (self.tia.level() + pk) * 0.5
                 };
                 self.audio.pokey_acc = 0.0;
                 self.audio.pokey_n = 0;
@@ -313,22 +313,25 @@ impl System {
         self.mem.bios_enabled = val & 0x04 == 0 && self.mem.has_bios();
     }
 
-    /// Номер регистра POKEY, если адрес попадает в его окно.
-    fn pokey_reg(&self, addr: u16) -> Option<u8> {
-        let base = self.pokey_base?;
-        let hit = if base == 0x4000 {
-            (0x4000..0x8000).contains(&addr)
-        } else {
-            (base..base + 0x10).contains(&addr)
-        };
-        hit.then_some((addr & 0x0F) as u8)
+    /// Какой POKEY и какой его регистр соответствуют адресу (если вообще соответствуют).
+    fn pokey_reg(&self, addr: u16) -> Option<(usize, u8)> {
+        self.pokeys
+            .iter()
+            .position(|(base, _)| {
+                if *base == 0x4000 {
+                    (0x4000..0x8000).contains(&addr)
+                } else {
+                    (*base..*base + 0x10).contains(&addr)
+                }
+            })
+            .map(|i| (i, (addr & 0x0F) as u8))
     }
 }
 
 impl cpu::Bus for System {
     fn read(&mut self, addr: u16) -> u8 {
-        if let Some(reg) = self.pokey_reg(addr) {
-            return self.pokey.as_ref().map_or(0xFF, |p| p.read(reg));
+        if let Some((i, reg)) = self.pokey_reg(addr) {
+            return self.pokeys[i].1.read(reg);
         }
         match addr {
             0x0000..=0x003F | 0x0100..=0x013F => {
@@ -346,10 +349,8 @@ impl cpu::Bus for System {
     }
 
     fn write(&mut self, addr: u16, val: u8) {
-        if let Some(reg) = self.pokey_reg(addr) {
-            if let Some(p) = self.pokey.as_mut() {
-                p.write(reg, val);
-            }
+        if let Some((i, reg)) = self.pokey_reg(addr) {
+            self.pokeys[i].1.write(reg, val);
             return;
         }
         match addr {

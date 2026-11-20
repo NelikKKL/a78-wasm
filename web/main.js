@@ -71,6 +71,43 @@ function pushAudio(samples) {
   nextAudio += buf.duration;
 }
 
+// ---------- геймпады ----------
+// Стандартная раскладка Gamepad API: 0 = A, 1 = B, 2 = X, 3 = Y, 8 = Back, 9 = Start, 12–15 = крестовина.
+// Первый геймпад — игрок 1, второй — игрок 2.
+let padState = new Map(); // id действия -> зажато ли сейчас
+
+function pollGamepads() {
+  if (!con || !navigator.getGamepads) return;
+  const now = new Map();
+  const pads = navigator.getGamepads();
+  for (let player = 0; player < 2; player++) {
+    const pad = pads[player];
+    if (!pad || !pad.connected) continue;
+    const p = player + 1;
+    const btn = (i) => !!pad.buttons[i]?.pressed;
+    const ax = pad.axes[0] ?? 0;
+    const ay = pad.axes[1] ?? 0;
+    const hold = (id, on) => on && now.set(id, true);
+    hold(`p${p}.up`, btn(12) || ay < -0.5);
+    hold(`p${p}.down`, btn(13) || ay > 0.5);
+    hold(`p${p}.left`, btn(14) || ax < -0.5);
+    hold(`p${p}.right`, btn(15) || ax > 0.5);
+    hold(`p${p}.fire1`, btn(0));
+    hold(`p${p}.fire2`, btn(1) || btn(2));
+    if (player === 0) {
+      hold("pause", btn(9));
+      hold("select", btn(8));
+      hold("reset", btn(3));
+    }
+  }
+  for (const id of new Set([...padState.keys(), ...now.keys()])) {
+    const was = padState.get(id) ?? false;
+    const is = now.get(id) ?? false;
+    if (was !== is) con.action_event(id, is);
+  }
+  padState = now;
+}
+
 // ---------- кадры ----------
 
 function draw() {
@@ -85,6 +122,7 @@ function tick(now) {
   requestAnimationFrame(tick);
   const dt = Math.min(now - last, 100);
   last = now;
+  pollGamepads();
   if (!loaded || paused) return;
 
   acc += dt;
@@ -111,7 +149,7 @@ function startCartridge(data, name) {
     loaded = true;
     paused = false;
     acc = 0;
-    setStatus(title || name);
+    setStatus(`${title || name} — ${con.cart_description()}`);
   } catch (e) {
     setStatus(`Не удалось открыть «${name}»: ${e.message ?? e}`);
   }

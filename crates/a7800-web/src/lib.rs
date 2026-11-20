@@ -42,6 +42,11 @@ impl Console {
         self.emu.reset();
     }
 
+    /// Описание картриджа: схема банков, размер, RAM и POKEY.
+    pub fn cart_description(&self) -> String {
+        self.emu.cart_description()
+    }
+
     pub fn run_frame(&mut self) {
         self.emu.run_frame();
     }
@@ -80,12 +85,14 @@ impl Console {
             None => String::new(),
         };
         format!(
-            "кадр {}, NMI {}\n\
+            "картридж: {}\n\
+             кадр {}, NMI {}\n\
              PC={:04X} A={:02X} X={:02X} Y={:02X} SP={:02X} P={:02X}\n\
              MARIA: {}, CTRL={:02X}, DPP={:04X}, CHARBASE={:02X}, фон={:02X}\n\
              INPTCTRL={:02X}, BIOS: {}\n\
              неофициальных опкодов выполнено: {}{}\n\
-             пропущено байтов графики (режим не реализован): {}{}{}",
+             строк с недопустимым режимом чтения MARIA (RM=1): {}{}{}",
+            d.cart,
             d.frames,
             d.nmi_count,
             d.pc,
@@ -114,6 +121,17 @@ impl Console {
     /// `code` — `KeyboardEvent.code`. Возвращает `true`, если клавиша привязана.
     pub fn key_event(&mut self, code: &str, pressed: bool) -> bool {
         self.emu.handle_key(&self.bindings, code, pressed)
+    }
+
+    /// Применяет действие напрямую (для геймпада): id вида `p1.up`, `p2.fire1`, `pause`.
+    pub fn action_event(&mut self, action_id: &str, pressed: bool) -> bool {
+        match Action::from_id(action_id) {
+            Some(a) => {
+                self.emu.input_mut().apply(a, pressed);
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn is_bound(&self, code: &str) -> bool {
