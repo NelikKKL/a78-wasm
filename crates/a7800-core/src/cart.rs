@@ -75,6 +75,8 @@ pub struct Cartridge {
     pub pal: bool,
     /// RAM на картридже банкуется, а мы даём плоские 16 КБ — упрощение.
     ram_approx: bool,
+    /// RAM на $4000 создана автоматически: игра в неё пишет, а образ о ней ничего не сообщает.
+    ram_auto: bool,
     /// Последние записи в ROM-пространство (адрес, значение) — переключения банков.
     bank_log: Vec<(u16, u8)>,
 }
@@ -309,6 +311,7 @@ impl Cartridge {
             bank: 0,
             pal: false,
             ram_approx: false,
+            ram_auto: false,
             bank_log: Vec::new(),
         })
     }
@@ -327,6 +330,9 @@ impl Cartridge {
             s.push_str(", RAM на $4000");
             if self.ram_approx {
                 s.push_str(" (банкованная — упрощено до 16 КБ)");
+            }
+            if self.ram_auto {
+                s.push_str(" (создана автоматически по записи игры)");
             }
         }
         for a in &self.pokey_at {
@@ -411,12 +417,30 @@ impl Cartridge {
         }
     }
 
+    /// Может ли в $4000–$7FFF быть RAM: там не должно лежать ROM, которую читает игра.
+    fn ram_can_appear(&self) -> bool {
+        match self.mapper {
+            Mapper::SuperGame => true,
+            Mapper::Linear => 0x10000 - self.rom.len() >= 0x8000,
+            _ => false,
+        }
+    }
+
     pub fn write(&mut self, addr: u16, val: u8) {
         let a = addr as usize;
-        if (0x4000..0x8000).contains(&a) && !self.ram.is_empty() {
-            let i = self.ram_index(a);
-            self.ram[i] = val;
-            return;
+        if (0x4000..0x8000).contains(&a) {
+            // Образ без заголовка не говорит, есть ли на картридже RAM. Если игра пишет в
+            // $4000–$7FFF — она есть (так, например, у Winter Games), иначе записи терялись бы,
+            // а MARIA рисовала бы мусор.
+            if self.ram.is_empty() && self.ram_can_appear() {
+                self.ram = vec![0; 0x4000];
+                self.ram_auto = true;
+            }
+            if !self.ram.is_empty() {
+                let i = self.ram_index(a);
+                self.ram[i] = val;
+                return;
+            }
         }
         if self.bank_log.len() >= 6 {
             self.bank_log.remove(0);
@@ -545,6 +569,24 @@ mod tests {
         let cart = Cartridge::from_bytes(&a78(banked(8), 0x0002)).unwrap();
         assert_eq!(cart.mapper, Mapper::SuperGame);
         assert!(!cart.auto_detected);
+    }
+
+    #[test]
+    fn ram_appears_when_game_writes_to_4000() {
+        // образ без заголовка, о RAM ничего не известно: до записи там ROM предпоследнего банка
+        let mut cart = Cartridge::from_bytes(&banked(8)).unwrap();
+        assert_eq!(cart.read(0x4000), 6);
+        cart.write(0x5866, 0x0C);
+        assert_eq!(cart.read(0x5866), 0x0C);
+        assert!(cart.describe().contains("автоматически по записи"));
+        // записи в ROM-пространство ($8000 и выше) RAM не создают
+        let mut cart = Cartridge::from_bytes(&banked(8)).unwrap();
+        cart.write(0x8000, 3);
+        assert!(!cart.describe().contains("RAM"));
+        // у 48-КБ образа в $4000–$7FFF лежит ROM — RAM там появиться не может
+        let mut cart = Cartridge::from_bytes(&banked(3)).unwrap();
+        cart.write(0x4000, 0x55);
+        assert_ne!(cart.read(0x4000), 0x55);
     }
 
     #[test]

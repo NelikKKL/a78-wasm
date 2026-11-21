@@ -31,7 +31,7 @@ export function buildTestRom() {
     const list = z === 14 ? EMPTY : DL;
     put(DLL + z * 3, [z === 0 ? 0x8f : 0x0f, list >> 8, list & 0xff]);
   }
-  put(DLL + 15 * 3, [0, 0, 0]); //        следующая запись без DLI
+  put(DLL + 15 * 3, new Array(15).fill(0)); // хвост списка без DLI (окно DMA — 243 строки)
   put(EMPTY, [0x00, 0x00]);
 
   // Список отображения. Режим записи MARIA запоминается между строками, поэтому

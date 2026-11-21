@@ -86,6 +86,16 @@ impl Region {
         }
     }
 
+    /// Сколько строк подряд MARIA читает списки отображения после гашения: 243 в NTSC и 293 в PAL.
+    /// Это больше, чем видно на экране: игры ставят флаг DLI в зону *после* видимой области
+    /// и используют это прерывание как сигнал конца кадра — без него они зависают или мерцают.
+    pub fn dma_lines(self) -> usize {
+        match self {
+            Region::Ntsc => 243,
+            Region::Pal => 293,
+        }
+    }
+
     /// Высота видимой части кадра в пикселях.
     pub fn screen_height(self) -> usize {
         match self {
@@ -203,6 +213,8 @@ pub struct Emulator {
     nmi_count: u64,
     region: Region,
     forced_region: Option<Region>,
+    /// Строка-приёмник для линий DMA, которые не попадают в видимый кадр.
+    scratch: Vec<u8>,
 }
 
 impl Emulator {
@@ -217,6 +229,7 @@ impl Emulator {
             nmi_count: 0,
             region: Region::Ntsc,
             forced_region: config.region,
+            scratch: vec![0; SCREEN_W * 4],
         };
         if let Some(r) = config.region {
             emu.apply_region(r);
@@ -348,8 +361,9 @@ impl Emulator {
 
         let lines = self.region.lines();
         let height = self.frame.height;
+        let dma_lines = self.region.dma_lines();
         for line in 0..lines {
-            let active = (ACTIVE_START..ACTIVE_START + height).contains(&line);
+            let active = (ACTIVE_START..ACTIVE_START + dma_lines).contains(&line);
             self.sys.maria.vblank = !active;
             if line == ACTIVE_START {
                 self.sys.maria.start_frame();
@@ -358,8 +372,13 @@ impl Emulator {
             let mut dma = 0i32;
             let mut nmi = false;
             if active {
-                let off = (line - ACTIVE_START) * SCREEN_W * 4;
-                let row = &mut self.frame.pixels[off..off + SCREEN_W * 4];
+                let y = line - ACTIVE_START;
+                let row = if y < height {
+                    let off = y * SCREEN_W * 4;
+                    &mut self.frame.pixels[off..off + SCREEN_W * 4]
+                } else {
+                    &mut self.scratch[..]
+                };
                 let info = self.sys.maria.render_line(&self.sys.mem, row, &self.palette);
                 dma = info.dma_cycles as i32;
                 nmi = info.nmi;
@@ -471,7 +490,7 @@ mod tests {
             let list = if z == 14 { dl + 0x40 } else { dl };
             put(&mut rom, dll + z * 3, &[flags, (list >> 8) as u8, (list & 0xFF) as u8]);
         }
-        put(&mut rom, dll + 15 * 3, &[0, 0, 0]); // следующая запись без DLI
+        put(&mut rom, dll + 15 * 3, &[0u8; 15]); // хвост списка: записи без DLI (окно DMA — 243 строки)
         put(&mut rom, dl + 0x40, &[0, 0]); // пустой список
         // 4-байтовый заголовок: палитра 0, 4 байта графики, x = 20; затем конец списка
         put(&mut rom, dl, &[0x00, 0x1C, (gfx >> 8) as u8, 20, 0x00, 0x00]);
@@ -533,6 +552,43 @@ mod tests {
         let d = emu.debug_info();
         assert_eq!(d.pc, 0xC000);
         assert!(d.cart.contains("SuperGame") && d.cart.contains("128"), "{}", d.cart);
+    }
+
+    /// Регрессия: Galaga ставит DLI в зону после 241-й строки. Окно DMA в 240 строк до неё не доходило,
+    /// и игра ждала NMI вечно.
+    #[test]
+    fn dli_after_241_lines_still_fires() {
+        fn put(rom: &mut [u8], addr: usize, bytes: &[u8]) {
+            rom[addr - 0xC000..addr - 0xC000 + bytes.len()].copy_from_slice(bytes);
+        }
+        let mut rom = vec![0xEAu8; 0x4000];
+        let code = [
+            0x78, 0xD8, 0xA2, 0xFF, 0x9A, // SEI CLD LDX #$FF TXS
+            0xA9, 0x07, 0x85, 0x01, // INPTCTRL = 7
+            0xA9, 0xE0, 0x85, 0x2C, // DPPH
+            0xA9, 0x00, 0x85, 0x30, // DPPL
+            0xA9, 0x40, 0x85, 0x3C, // CTRL: DMA включён
+        ];
+        put(&mut rom, 0xC000, &code);
+        let spin = 0xC000 + code.len();
+        put(&mut rom, spin, &[0x4C, (spin & 0xFF) as u8, (spin >> 8) as u8]);
+        put(&mut rom, 0xC100, &[0x40]); // обработчик NMI: RTI
+        // 15 зон по 16 строк + одна зона из 1 строки = 241 строка, затем зона с DLI
+        for z in 0..16 {
+            let flags = if z == 15 { 0x00 } else { 0x0F };
+            put(&mut rom, 0xE000 + z * 3, &[flags, 0xE1, 0x00]);
+        }
+        put(&mut rom, 0xE000 + 16 * 3, &[0x80, 0xE1, 0x00]);
+        put(&mut rom, 0xE000 + 17 * 3, &[0u8; 12]);
+        put(&mut rom, 0xE100, &[0, 0]);
+        put(&mut rom, 0xFFFA, &[0x00, 0xC1, 0x00, 0xC0, 0x00, 0xC1]);
+
+        let mut emu = Emulator::new(Config::default());
+        emu.load_cartridge(&rom).unwrap();
+        for _ in 0..3 {
+            emu.run_frame();
+        }
+        assert_eq!(emu.debug_info().nmi_count, 3);
     }
 
     /// ROM в формате .a78 с заголовком, где байт 57 = 1 (PAL).
